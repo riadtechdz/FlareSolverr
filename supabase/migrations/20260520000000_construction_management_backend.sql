@@ -120,6 +120,27 @@ as $$
     )
 $$;
 
+create or replace function public.is_worker_assigned_to_site(target_site_id uuid, target_worker_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.material_requests
+    where site_id = target_site_id
+      and worker_id = target_worker_id
+  )
+  or exists (
+    select 1
+    from public.salary_requests
+    where site_id = target_site_id
+      and worker_id = target_worker_id
+  )
+$$;
+
 create or replace function public.can_access_profile(target_profile_id uuid)
 returns boolean
 language sql
@@ -196,10 +217,61 @@ begin
 end
 $$;
 
+create or replace function public.prevent_material_request_reassignment()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if coalesce(auth.role(), '') = 'service_role' or public.owns_site(old.site_id) then
+    return new;
+  end if;
+
+  if new.site_id is distinct from old.site_id
+    or new.worker_id is distinct from old.worker_id
+    or new.coordinator_id is distinct from old.coordinator_id then
+    raise exception 'material request assignment fields cannot be changed by this role';
+  end if;
+
+  return new;
+end
+$$;
+
+create or replace function public.prevent_salary_request_reassignment()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if coalesce(auth.role(), '') = 'service_role' or public.owns_site(old.site_id) then
+    return new;
+  end if;
+
+  if new.site_id is distinct from old.site_id
+    or new.worker_id is distinct from old.worker_id then
+    raise exception 'salary request assignment fields cannot be changed by this role';
+  end if;
+
+  return new;
+end
+$$;
+
 drop trigger if exists prevent_profile_role_change on public.profiles;
 create trigger prevent_profile_role_change
 before update of role on public.profiles
 for each row execute function public.prevent_profile_role_change();
+
+drop trigger if exists prevent_material_request_reassignment on public.material_requests;
+create trigger prevent_material_request_reassignment
+before update on public.material_requests
+for each row execute function public.prevent_material_request_reassignment();
+
+drop trigger if exists prevent_salary_request_reassignment on public.salary_requests;
+create trigger prevent_salary_request_reassignment
+before update on public.salary_requests
+for each row execute function public.prevent_salary_request_reassignment();
 
 alter table public.profiles enable row level security;
 alter table public.sites enable row level security;
@@ -219,7 +291,7 @@ create policy "Users can create their own profile"
 on public.profiles
 for insert
 to authenticated
-with check (id = auth.uid());
+with check (id = auth.uid() and role = 'worker');
 
 drop policy if exists "Users can update their own profile" on public.profiles;
 create policy "Users can update their own profile"
@@ -270,7 +342,11 @@ create policy "Workers can create their own material requests"
 on public.material_requests
 for insert
 to authenticated
-with check (public.current_user_role() = 'worker' and worker_id = auth.uid());
+with check (
+  public.current_user_role() = 'worker'
+  and worker_id = auth.uid()
+  and public.is_worker_assigned_to_site(site_id, worker_id)
+);
 
 drop policy if exists "Assigned coordinators and owners can update material requests" on public.material_requests;
 create policy "Assigned coordinators and owners can update material requests"
@@ -299,7 +375,11 @@ create policy "Workers can create their own salary requests"
 on public.salary_requests
 for insert
 to authenticated
-with check (public.current_user_role() = 'worker' and worker_id = auth.uid());
+with check (
+  public.current_user_role() = 'worker'
+  and worker_id = auth.uid()
+  and public.is_worker_assigned_to_site(site_id, worker_id)
+);
 
 drop policy if exists "Workers and owners can update salary requests" on public.salary_requests;
 create policy "Workers and owners can update salary requests"
@@ -355,8 +435,10 @@ grant all on public.transactions to authenticated;
 revoke all on function public.current_user_role() from public;
 revoke all on function public.owns_site(uuid) from public;
 revoke all on function public.can_access_site(uuid) from public;
+revoke all on function public.is_worker_assigned_to_site(uuid, uuid) from public;
 revoke all on function public.can_access_profile(uuid) from public;
 grant execute on function public.current_user_role() to authenticated;
 grant execute on function public.owns_site(uuid) to authenticated;
 grant execute on function public.can_access_site(uuid) to authenticated;
+grant execute on function public.is_worker_assigned_to_site(uuid, uuid) to authenticated;
 grant execute on function public.can_access_profile(uuid) to authenticated;
