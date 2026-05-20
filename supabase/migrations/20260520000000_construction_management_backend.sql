@@ -24,6 +24,15 @@ create table if not exists public.sites (
   status text not null default 'active'
 );
 
+create table if not exists public.site_members (
+  site_id uuid not null references public.sites(id) on delete cascade,
+  profile_id uuid not null references public.profiles(id) on delete cascade,
+  role public.user_role not null,
+  created_at timestamptz not null default now(),
+  primary key (site_id, profile_id),
+  check (role in ('coordinator', 'worker'))
+);
+
 create table if not exists public.material_requests (
   id uuid primary key default extensions.gen_random_uuid(),
   site_id uuid not null references public.sites(id) on delete cascade,
@@ -65,6 +74,7 @@ create table if not exists public.transactions (
 );
 
 create index if not exists sites_owner_id_idx on public.sites(owner_id);
+create index if not exists site_members_profile_id_idx on public.site_members(profile_id);
 create index if not exists material_requests_site_id_idx on public.material_requests(site_id);
 create index if not exists material_requests_worker_id_idx on public.material_requests(worker_id);
 create index if not exists material_requests_coordinator_id_idx on public.material_requests(coordinator_id);
@@ -108,19 +118,13 @@ as $$
   select public.owns_site(target_site_id)
     or exists (
       select 1
-      from public.material_requests
+      from public.site_members
       where site_id = target_site_id
-        and (worker_id = auth.uid() or coordinator_id = auth.uid())
-    )
-    or exists (
-      select 1
-      from public.salary_requests
-      where site_id = target_site_id
-        and worker_id = auth.uid()
+        and profile_id = auth.uid()
     )
 $$;
 
-create or replace function public.is_worker_assigned_to_site(target_site_id uuid, target_worker_id uuid)
+create or replace function public.is_member_assigned_to_site(target_site_id uuid, target_profile_id uuid, target_role public.user_role default null)
 returns boolean
 language sql
 stable
@@ -129,15 +133,10 @@ set search_path = public
 as $$
   select exists (
     select 1
-    from public.material_requests
+    from public.site_members
     where site_id = target_site_id
-      and worker_id = target_worker_id
-  )
-  or exists (
-    select 1
-    from public.salary_requests
-    where site_id = target_site_id
-      and worker_id = target_worker_id
+      and profile_id = target_profile_id
+      and (target_role is null or role = target_role)
   )
 $$;
 
@@ -154,17 +153,10 @@ as $$
       and (
         exists (
           select 1
-          from public.material_requests mr
-          join public.sites s on s.id = mr.site_id
+          from public.site_members sm
+          join public.sites s on s.id = sm.site_id
           where s.owner_id = auth.uid()
-            and target_profile_id in (mr.worker_id, mr.coordinator_id)
-        )
-        or exists (
-          select 1
-          from public.salary_requests sr
-          join public.sites s on s.id = sr.site_id
-          where s.owner_id = auth.uid()
-            and sr.worker_id = target_profile_id
+            and sm.profile_id = target_profile_id
         )
         or exists (
           select 1
@@ -179,9 +171,11 @@ as $$
       and (
         exists (
           select 1
-          from public.material_requests
-          where coordinator_id = auth.uid()
-            and worker_id = target_profile_id
+          from public.site_members my_site
+          join public.site_members other_site on other_site.site_id = my_site.site_id
+          where my_site.profile_id = auth.uid()
+            and my_site.role = 'coordinator'
+            and other_site.profile_id = target_profile_id
         )
         or exists (
           select 1
@@ -195,9 +189,12 @@ as $$
       public.current_user_role() = 'worker'
       and exists (
         select 1
-        from public.material_requests
-        where worker_id = auth.uid()
-          and coordinator_id = target_profile_id
+        from public.site_members my_site
+        join public.site_members other_site on other_site.site_id = my_site.site_id
+        where my_site.profile_id = auth.uid()
+          and my_site.role = 'worker'
+          and other_site.profile_id = target_profile_id
+          and other_site.role = 'coordinator'
       )
     )
 $$;
@@ -275,6 +272,7 @@ for each row execute function public.prevent_salary_request_reassignment();
 
 alter table public.profiles enable row level security;
 alter table public.sites enable row level security;
+alter table public.site_members enable row level security;
 alter table public.material_requests enable row level security;
 alter table public.salary_requests enable row level security;
 alter table public.transactions enable row level security;
@@ -330,6 +328,21 @@ for delete
 to authenticated
 using (public.current_user_role() = 'owner' and owner_id = auth.uid());
 
+drop policy if exists "Site members are visible to site participants" on public.site_members;
+create policy "Site members are visible to site participants"
+on public.site_members
+for select
+to authenticated
+using (public.can_access_site(site_id));
+
+drop policy if exists "Owners manage members for their sites" on public.site_members;
+create policy "Owners manage members for their sites"
+on public.site_members
+for all
+to authenticated
+using (public.current_user_role() = 'owner' and public.owns_site(site_id))
+with check (public.current_user_role() = 'owner' and public.owns_site(site_id));
+
 drop policy if exists "Material requests are visible to involved users" on public.material_requests;
 create policy "Material requests are visible to involved users"
 on public.material_requests
@@ -345,7 +358,8 @@ to authenticated
 with check (
   public.current_user_role() = 'worker'
   and worker_id = auth.uid()
-  and public.is_worker_assigned_to_site(site_id, worker_id)
+  and public.is_member_assigned_to_site(site_id, worker_id, 'worker')
+  and (coordinator_id is null or public.is_member_assigned_to_site(site_id, coordinator_id, 'coordinator'))
 );
 
 drop policy if exists "Assigned coordinators and owners can update material requests" on public.material_requests;
@@ -378,7 +392,7 @@ to authenticated
 with check (
   public.current_user_role() = 'worker'
   and worker_id = auth.uid()
-  and public.is_worker_assigned_to_site(site_id, worker_id)
+  and public.is_member_assigned_to_site(site_id, worker_id, 'worker')
 );
 
 drop policy if exists "Workers and owners can update salary requests" on public.salary_requests;
@@ -429,16 +443,17 @@ grant usage on schema public to authenticated;
 grant usage on schema extensions to authenticated;
 grant all on public.profiles to authenticated;
 grant all on public.sites to authenticated;
+grant all on public.site_members to authenticated;
 grant all on public.material_requests to authenticated;
 grant all on public.salary_requests to authenticated;
 grant all on public.transactions to authenticated;
 revoke all on function public.current_user_role() from public;
 revoke all on function public.owns_site(uuid) from public;
 revoke all on function public.can_access_site(uuid) from public;
-revoke all on function public.is_worker_assigned_to_site(uuid, uuid) from public;
+revoke all on function public.is_member_assigned_to_site(uuid, uuid, public.user_role) from public;
 revoke all on function public.can_access_profile(uuid) from public;
 grant execute on function public.current_user_role() to authenticated;
 grant execute on function public.owns_site(uuid) to authenticated;
 grant execute on function public.can_access_site(uuid) to authenticated;
-grant execute on function public.is_worker_assigned_to_site(uuid, uuid) to authenticated;
+grant execute on function public.is_member_assigned_to_site(uuid, uuid, public.user_role) to authenticated;
 grant execute on function public.can_access_profile(uuid) to authenticated;
